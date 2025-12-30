@@ -9,7 +9,8 @@ variants and evaluates how well UniRep zero-shot scores correlate with the
 experimental DMS measurements.
 
 Expected input columns (per row / variant):
-  - `mutant`: mutation string like "A123G" or "A123G:C124D"
+  - `mutant`: mutation string in the common format like "A123G"
+              (wildtype AA, 1-based position, mutant AA).
   - `mutated_sequence`: the full *mutant* protein sequence.
   - `DMS_score`: the experimental fitness/score for this variant.
 
@@ -25,125 +26,62 @@ Outputs:
 import argparse
 import math
 import os
-import re
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+from scipy.stats import spearmanr
 
 from data_utils import aa_seq_to_int, get_aa_to_int
 from unirep import babbler64, babbler1900, babbler256, initialize_uninitialized
 
 
 REQUIRED_COLS = {"mutant", "mutated_sequence", "DMS_score"}
-MUT_RE = re.compile(r"^([A-Za-z])(\d+)([A-Za-z])$")
 VALID_UNIREP_AAS = set("MRHKDESTNQCUGPAVIFYWLO")
 
 
-def _fmt_float(x, fmt):
+def compute_spearman(pred_scores, true_scores) -> tuple[float | None, float | None]:
+    """Compute Spearman correlation, returning (rho, pval) with NaN-safe handling."""
+    rho, pval = spearmanr(pred_scores, true_scores, nan_policy="omit")
+    rho_val = None if rho is None or (isinstance(rho, float) and math.isnan(rho)) else float(rho)
+    pval_val = None if pval is None or (isinstance(pval, float) and math.isnan(pval)) else float(pval)
+    return rho_val, pval_val
+
+
+def _fmt_float(x: float | None, *, fmt: str) -> str:
     return "nan" if x is None else format(x, fmt)
 
 
-def _rankdata_average_ties(x: np.ndarray) -> np.ndarray:
-    """
-    Rank with average method for ties (1..n), similar to scipy.stats.rankdata(method="average").
-    """
-    order = np.argsort(x, kind="mergesort")
-    ranks = np.empty_like(order, dtype=np.float64)
-
-    n = x.size
-    i = 0
-    while i < n:
-        j = i
-        while j + 1 < n and x[order[j + 1]] == x[order[i]]:
-            j += 1
-        avg_rank = (i + j) / 2.0 + 1.0
-        ranks[order[i : j + 1]] = avg_rank
-        i = j + 1
-    return ranks
+def parse_mutant(mut_str: str) -> tuple[str, int, str]:
+    """Parse a mutation string like 'A123G' -> (wt_aa, pos1, mut_aa)."""
+    # Convention: first char = WT AA, last char = mutant AA, middle = 1-based position.
+    wt_aa = mut_str[0].upper()
+    mut_aa = mut_str[-1].upper()
+    pos1 = int(mut_str[1:-1])
+    return wt_aa, pos1, mut_aa
 
 
-def spearmanr(x, y):
-    """
-    Spearman correlation with a lightweight fallback (no p-value).
-    Returns (rho, pval). pval is None in fallback mode.
-    """
-    try:
-        from scipy.stats import spearmanr as scipy_spearmanr  # type: ignore
-
-        rho, pval = scipy_spearmanr(x, y, nan_policy="omit")
-        rho_val = None if rho is None or (isinstance(rho, float) and math.isnan(rho)) else float(rho)
-        pval_val = None if pval is None or (isinstance(pval, float) and math.isnan(pval)) else float(pval)
-        return rho_val, pval_val
-    except Exception:
-        pass
-
-    x_arr = np.asarray(x, dtype=np.float64)
-    y_arr = np.asarray(y, dtype=np.float64)
-    mask = np.isfinite(x_arr) & np.isfinite(y_arr)
-    x_arr = x_arr[mask]
-    y_arr = y_arr[mask]
-    if x_arr.size < 2:
-        return None, None
-
-    rx = _rankdata_average_ties(x_arr)
-    ry = _rankdata_average_ties(y_arr)
-    rx -= rx.mean()
-    ry -= ry.mean()
-    denom = float(np.sqrt((rx**2).sum() * (ry**2).sum()))
-    if denom == 0.0:
-        return None, None
-    return float((rx * ry).sum() / denom), None
+def recover_wt_sequence(mut_seq: str, wt_aa: str, pos1: int) -> str:
+    """Reconstruct the wildtype sequence by restoring the WT residue at `pos1` (1-based)."""
+    return mut_seq[: pos1 - 1] + wt_aa + mut_seq[pos1:]
 
 
-def parse_mutant(mut_str):
-    """
-    Parse mutation string like "A123G" or "A123G:C124D" into (wt_aa, pos1, mut_aa) list.
-    """
-    muts = []
-    for part in str(mut_str).split(":"):
-        part = part.strip()
-        if not part:
-            continue
-        m = MUT_RE.match(part)
-        if not m:
-            raise ValueError(f"Bad mutation token: {part!r}")
-        wt_aa, pos1_s, mut_aa = m.group(1).upper(), m.group(2), m.group(3).upper()
-        muts.append((wt_aa, int(pos1_s), mut_aa))
-    if not muts:
-        raise ValueError(f"Empty mutation string: {mut_str!r}")
-    return muts
-
-
-def recover_wt_sequence(mut_seq, muts):
-    """
-    Reconstruct WT sequence by undoing the mutation(s) from the provided mutant sequence.
-    """
-    seq = list(str(mut_seq))
-    for wt_aa, pos1, mut_aa in muts:
-        if pos1 < 1 or pos1 > len(seq):
-            raise ValueError(f"Position out of range: {wt_aa}{pos1}{mut_aa} for length {len(seq)}")
-        observed = seq[pos1 - 1].upper()
-        if observed != mut_aa:
-            raise ValueError(f"Mut AA mismatch in {wt_aa}{pos1}{mut_aa}: seq has {observed}")
-        seq[pos1 - 1] = wt_aa
-    return "".join(seq)
-
-
-def resolve_csv_paths(data_dir, csv):
+def resolve_csv_paths(*, data_dir: Path, csv: str | None) -> list[Path]:
     if csv is None:
+        # Batch mode: process all CSVs in the data directory (non-recursive).
         return sorted(p for p in data_dir.glob("*.csv") if p.is_file())
     candidate = Path(csv)
     if not candidate.is_absolute():
+        # Treat relative paths as basenames/relative paths under the configured data directory.
         candidate = (data_dir / candidate).resolve()
     if not candidate.exists():
         raise FileNotFoundError(f"CSV not found: {candidate}")
     return [candidate]
 
 
-def load_dataset(csv_path):
+def load_dataset(*, csv_path: Path) -> pd.DataFrame:
     df = pd.read_csv(csv_path)
     missing = REQUIRED_COLS - set(df.columns)
     if missing:
@@ -328,21 +266,21 @@ def run_one_csv(
 ):
     df = load_dataset(csv_path=csv_path)
 
-    muts_list = []
-    wt_seqs = []
-    mut_seqs = []
-    true_scores = []
+    muts_list: list[list[tuple[str, int, str]]] = []
+    wt_seqs: list[str] = []
+    mut_seqs: list[str] = []
+    true_scores: list[float] = []
 
     total = len(df)
-    for i, (_, row) in enumerate(df.iterrows(), start=1):
-        mut_str = str(row["mutant"])
-        mut_seq = str(row["mutated_sequence"]).strip()
-        dms = float(row["DMS_score"])
+    for i, row in enumerate(df.itertuples(index=False), start=1):
+        mut_str = str(getattr(row, "mutant"))
+        mut_seq = str(getattr(row, "mutated_sequence")).strip()
+        dms = float(getattr(row, "DMS_score"))
 
-        muts = parse_mutant(mut_str)
-        wt_seq = recover_wt_sequence(mut_seq, muts)
+        wt_aa, pos1, mut_aa = parse_mutant(mut_str)
+        wt_seq = recover_wt_sequence(mut_seq, wt_aa, pos1)
 
-        muts_list.append(muts)
+        muts_list.append([(wt_aa, pos1, mut_aa)])
         wt_seqs.append(wt_seq)
         mut_seqs.append(mut_seq)
         true_scores.append(dms)
@@ -386,7 +324,7 @@ def run_one_csv(
         else:
             raise ValueError(f"Unknown mode: {mode}")
 
-    rho, pval = spearmanr(pred, true_scores)
+    rho, pval = compute_spearman(pred, true_scores)
     df["unirep_delta_logp"] = pred
 
     out_name = f"{csv_path.stem}{output_suffix}"
@@ -398,8 +336,8 @@ def run_one_csv(
     print(f"Mode:         {mode}")
     print(f"CSV:          {csv_path.name}")
     print(f"Variants:     {len(df)}")
-    print(f"Spearman ρ:   {_fmt_float(rho, '.4f')}")
-    print(f"P-value:      {_fmt_float(pval, '.2e')}")
+    print(f"Spearman ρ:   {_fmt_float(rho, fmt='.4f')}")
+    print(f"P-value:      {_fmt_float(pval, fmt='.2e')}")
     print(f"Saved to:     {out_path}")
     print("==========================================\n")
 
